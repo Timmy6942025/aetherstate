@@ -63,6 +63,7 @@ class OpenAILLM(LLMInterface):
         self.api_key = model_cfg.api_key
         self.random_seed = getattr(model_cfg, "random_seed", None)
         self.reasoning_effort = getattr(model_cfg, "reasoning_effort", None)
+        self.default_headers = getattr(model_cfg, "default_headers", None)
 
         # Manual mode: enabled via llm.manual_mode in config.yaml
         self.manual_mode = (getattr(model_cfg, "manual_mode", False) is True)
@@ -87,6 +88,7 @@ class OpenAILLM(LLMInterface):
                 base_url=self.api_base,
                 timeout=self.timeout,
                 max_retries=max_retries,
+                default_headers=self.default_headers,
             )
 
         # Only log unique models to reduce duplication
@@ -132,7 +134,7 @@ class OpenAILLM(LLMInterface):
         )
 
         # Check if this is an OpenAI reasoning model based on model name pattern
-        # This works for all endpoints (OpenAI, Azure, OptiLLM, OpenRouter, etc.)
+        # This works for all endpoints (OpenAI, Azure, Novita, OpenRouter, etc.)
         model_lower = str(self.model).lower()
         is_openai_reasoning_model = model_lower.startswith(OPENAI_REASONING_MODEL_PREFIXES)
 

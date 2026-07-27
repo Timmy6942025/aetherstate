@@ -53,6 +53,18 @@ htmlcov/
 .DS_Store
 .venv
 
-# For SR
+# AetherState outputs (large, regenerated)
+tasks/aetherstate/outputs/
+tasks/aetherstate/__pycache__/
+tasks/aetherstate/aetherstate
+tasks/aetherstate/seed_engine_train
+*.bin
+*.o
+*.so
+
+# API keys / secrets
 secrets.yaml
+.env
+
+# For SR
 problems

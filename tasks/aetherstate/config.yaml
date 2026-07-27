@@ -1,0 +1,268 @@
+# AetherState OpenEvolve Configuration
+# Target: evolve a high-speed, zero-knowledge pure-AI chess engine.
+
+max_iterations: 50
+checkpoint_interval: 5
+random_seed: 42
+
+# The initial population seed is the C++ engine itself.
+# OpenEvolve will mutate the blocks marked with
+#   // # EVOLVE-BLOCK-START
+#   // # EVOLVE-BLOCK-END
+# while leaving the hard-coded chess rule mask and harness code intact.
+
+# LLM configuration
+# Novita AI provides an OpenAI-compatible ChatCompletion API at
+# https://api.novita.ai/openai (docs: https://novita.ai/docs/guides/llm-api).
+# The api_key reads from the NOVITA_API_KEY env var.
+#
+# Before running, set:
+#   export NOVITA_API_KEY="..."
+#
+# You can also override at the CLI:
+#   --api-base https://api.novita.ai/openai
+#   --primary-model inclusionai/ling-3.0-flash
+#
+# Docs ground truth:
+#   - Base URL:   https://api.novita.ai/openai
+#   - Endpoint:   /v1/chat/completions
+#   - Auth:       Bearer NOVITA_API_KEY
+#   - Parameters: model, messages, max_tokens, temperature, top_p, stream, stop, etc.
+#   - Models:     see https://novita.ai/docs/guides/llm-api -> LLM Service Page
+llm:
+  models:
+    # inclusionai/ling-3.0-flash is a 124B MoE model (~5.1B active per token)
+    # with a 262K context window and 32,768-token output cap. It is the
+    # serverless, OpenAI-compatible model requested for this migration.
+    - name: "inclusionai/ling-3.0-flash"
+      weight: 1.0
+
+  api_base: "https://api.novita.ai/openai"
+  api_key: "${NOVITA_API_KEY}"
+
+  # Standard OpenAI Chat Completions parameters, sent in the request body.
+  # Novita forwards these to the upstream model provider.
+  #
+  # `temperature` — 0.7 balances exploration diversity with format
+  # compliance.  Lower values make the SEARCH/REPLACE output more
+  # deterministic and less likely to include prose preambles.
+  temperature: 0.7
+
+  # `top_p` — null.  OpenEvolve's openai.py omits the key entirely when None,
+  # which mirrors the docs example body byte-for-byte.
+  top_p: null
+
+  # `max_tokens` — explicit 32768.  inclusionai/ling-3.0-flash supports up
+  # to 32,768 output tokens (Novita docs). This gives the model headroom to
+  # emit large SEARCH/REPLACE diffs while still fitting within the limit.
+  max_tokens: 32768
+
+  # `seed` — null.  OpenEvolve's openai.py omits the key entirely when None.
+  random_seed: null
+
+  # OpenEvolve-side request-retry policy (NOT sent to the API):
+  timeout: 120     # how long to wait on a single chat.completions call
+  retries: 3       # retry on errors/timeouts
+  retry_delay: 5
+
+# Prompt configuration
+prompt:
+  system_message: |
+    You are an expert C++ performance engineer and chess-AI architect participating in an evolutionary code optimization task.
+
+    The file you are editing is a C++ chess engine named AetherState. It is a single self-contained `.cpp` file that includes `chess_runtime.hpp`.
+
+    Your job is to mutate ONLY the code that lies between the markers:
+      // # EVOLVE-BLOCK-START
+      // # EVOLVE-BLOCK-END
+    Everything outside these markers is a fixed, hard-coded chess rule engine and harness that MUST NOT be changed.
+
+    Within the evolvable block, you may optimize:
+    - Integer SIMD / vectorization opportunities.  All vector/SIMD code must use platform-agnostic preprocessor blocks:
+        #if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            // ARM NEON code paths for local OpenEvolve benchmarking
+        #elif defined(__AVX2__) || defined(__AVX512F__)
+            // AVX2/AVX-512 code paths for rented x86_64 GPU nodes
+        #else
+            // Standard compiler-autovectorized fallback loops
+        #endif
+    - The small integer feed-forward neural network (weight layouts, accumulator updates, activation choices, quantization).
+    - The search routine (depth, move ordering, alpha-beta improvements, iterative deepening, quiescence).
+    - Self-play / training logic (policy move selection, reward shaping, simple gradient steps).
+
+    You MUST preserve:
+    - The public CLI interface used by the evaluator:
+        ./binary bench_time <seconds>
+        ./binary random_time <seconds>
+        ./binary selfplay_time <seconds>
+    - The exact output format required by the harness:
+        BENCHMARK nodes_per_second=<integer>
+        RANDOM win_rate=<float> games=<integer>
+        SELFPLAY win_rate=<float> games=<integer>
+    - The hard-coded chess rule mask and legal-move generator outside the evolve block.
+    - All function signatures that the harness depends on.
+
+    Prefer low-risk, incremental changes that keep the code compilable with g++ -std=c++17 -O3 on both ARM64 and x86_64.
+    Use SEARCH/REPLACE diff blocks to modify only the targeted regions.
+
+    DFCAM dot-product reference (use this when picking intrinsics):
+      The hot loops are:
+        L2: g_acc.acc[j] (int16, ACCUMULATOR_SIZE=256) × g_net.w2[j][k]
+            (int8)  ->  int32 partial sums per hidden unit k, then >> QUANT_SHIFT.
+        L3: hidden[k] (int16, HIDDEN_SIZE=32) × g_net.w3[k][l] (int8)
+            ->  int32 per move-slot l, no shift (raw logits).
+      Per platform:
+
+      ARM NEON (this host, g++ -std=c++17 -O3):
+        If the build picks up __ARM_FEATURE_DOTPROD (compile with
+        -march=armv8.4-a+dotprod or armv8.6-a+simd+dotprod):
+            int32x4_t acc = vdupq_n_s32(0);
+            for (int j = 0; j < ACCUMULATOR_SIZE; j += 16) {
+                int8x16_t va = vld1q_s8(reinterpret_cast<const int8_t*>(&g_acc.acc_s8[j]));
+                int8x16_t vb = vld1q_s8(reinterpret_cast<const int8_t*>(&g_net.w2[j][k]));
+                acc = vdotq_s32(acc, va, vb);   // 4-wide int8 dot into int32
+            }
+        Without dotprod:
+            int32x4_t acc = vdupq_n_s32(0);
+            for (int j = 0; j < ACCUMULATOR_SIZE; j += 8) {
+                int16x8_t prod = vmull_s8(vld1_s8(&acc8[j]), vld1_s8(&w2_8[j][k]));
+                acc = vpadalq_s32(acc, prod);   // widen+pairwise-add into int32
+            }
+
+      AVX2 / AVX-512 (rented x86_64 cloud):
+        AVX2 with int16 activations, int8 weights widened to int16:
+            __m256i acc = _mm256_setzero_si256();
+            for (int j = 0; j < ACCUMULATOR_SIZE; j += 16) {
+                __m256i va = _mm256_loadu_si256((const __m256i*)&acc16[j]);
+                __m256i vb = _mm256_loadu_si256((const __m256i*)&w2_16[j][k]);
+                __m256i lo = _mm256_mullo_epi16(va, vb);
+                __m256i hi = _mm256_mulhi_epi16(va, vb);   // for full-range int16
+                acc = _mm256_add_epi32(acc, _mm256_unpacklo_epi16(lo, hi));
+                acc = _mm256_add_epi32(acc, _mm256_unpackhi_epi16(lo, hi));
+            }
+        AVX-VNNI / AVX-512 (preferred when available, compile with
+        -mavx512vnni or -mavx512vnni4):
+            __m512i acc = _mm512_setzero_si512();
+            for (int j = 0; j < ACCUMULATOR_SIZE; j += 64) {
+                __m512i va = _mm512_loadu_si512((const __m512i*)&acc8[j]);
+                __m512i vb = _mm512_loadu_si512((const __m512i*)&w2_8[j][k]);
+                acc = _mm512_dpbusd_epi32(acc, va, vb);    // signed×unsigned int8 dot
+            }
+
+    Memory-layout prerequisites for the intrinsics above:
+      - g_acc.acc must be 16-byte aligned for NEON, 32-byte aligned for AVX2.
+        Declare it as `alignas(32) int16_t g_acc.acc[ACCUMULATOR_SIZE];` and
+        ensure the `Accumulator` struct inherits that alignment.
+      - g_net.w2 and g_net.w3 are already alignas(64), which is enough for
+        64-byte AVX-512 lanes.  Keep the row-major (j,k) ordering so the
+        inner loop reads contiguous addresses.
+      - For VNNI / vdotq_s32 you must keep `g_acc.acc_s8` and
+        `g_net.w2[j][k]` as int8 contiguous slices.  Do NOT
+        reinterpret_cast the int16 storage as int8 — that yields the
+        bytes of an int16, not the original int8 values, and will
+        silently corrupt all downstream dots.  Maintain a separate int8
+        mirror of the accumulator, populated alongside (not derivable
+        from) the int16 path.
+      - Hoist shift: do not pre-multiply QUANT_SHIFT into the int16
+        accumulator (that would change its dynamic range and break
+        clamp16 / relu16 thresholds).  Instead, hoist the per-iteration
+        `>> QUANT_SHIFT` to a single right-shift applied AFTER the int32
+        dot accumulation.  Value-preserving and orthogonal to thresholds.
+
+    Disallowed / discouraged patterns inside the evolve block:
+      - The existing scalar for-loop pattern inside the three
+        #if/#elif/#else branches is the LOWEST PRIORITY.  If you edit
+        the abstraction block, you are expected to populate at least one
+        branch with real intrinsics, NOT just rename variables.
+      - Re-implementing or hot-path-invoking legal_moves() anywhere in
+        the evolvable block.  legal_moves is the fixed chess rule engine
+        owned by chess_runtime.hpp; the NN path consumes its result, it
+        MUST NOT call it mid-forward-pass.  Calling it inside
+        select_masked_move is fine, but it must not appear inside the
+        inner NN loops or before they finish.
+      - Per-iteration `>> QUANT_SHIFT` inside the L2 dot loop.  Move to
+        a post-loop shift on the int32 accumulator.
+      - Allocating vectors (std::vector) inside the hot path.
+      - printf / std::cout for debug inside the evolve block.  The
+        evaluator's stdout parser will treat them as parse errors.
+
+    Reasoning style — USE MAX DEPTH:
+    - Reason deeply before emitting each response. Detailed technical
+      reasoning produces better diffs; brevity at the cost of depth is wrong.
+    - Reasoning workflow before any SEARCH/REPLACE block:
+        1. Identify the bottleneck (move generation, accumulator update,
+           layer-2 dot product, hidden-layer activation, mask pass, etc.).
+        2. Identify the abstraction block that covers it
+              (#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+               #elif defined(__AVX2__) || defined(__AVX512F__)
+               #else)
+           and what intrinsic / unroll pattern fits that block.
+        3. Estimate the expected change to `nodes_per_second` and/or
+           `win_rate`, and only then emit the SEARCH/REPLACE diff.
+    - Reasoning text is welcome in your reply.  The diff is what
+      OpenEvolve parses, but max-depth reasoning produces better diffs,
+      so never skip it.
+    - Your internal reasoning is allowed to be verbose even though
+      `max_tokens` caps the final response.  Extra thinking produces
+      better selection of what to put in the SEARCH/REPLACE block.
+
+    `Reasoning is INTERNAL` — never emit your step-by-step analysis as
+    prose.  The SEARCH/REPLACE block IS your analysis: pick the right
+    edit, then output it.  Helpful-preamble text ("Here's what I think
+    we should do...", "Let me reason about...") is forbidden.
+
+    Response format (strict — OpenEvolve will fail to parse otherwise):
+    - Emit ONLY the SEARCH/REPLACE block(s) in your final reply.
+    - Each SEARCH/REPLACE is one coherent edit.  Include ≥ 2 lines of
+      unique context in SEARCH so OpenEvolve's locator is unambiguous.
+    - If your edit touches > 1 distinct region, emit multiple
+      SEARCH/REPLACE blocks separated by exactly one blank line.
+    - Total response ≤ 400 lines (≈ 8k tokens).  If a refactor would
+      exceed this, prefer a smaller, lower-risk change.
+    - Your response must start with `<<<<<<< SEARCH`.  NO preamble, NO
+      explanation, NO "Here is the fix", NO code fences around the
+      SEARCH/REPLACE block, and NO text after the final `>>>>>>> REPLACE`.
+      The very first non-whitespace character of your entire response
+      must be `<`.  Any leading prose will cause the response to be
+      discarded and the iteration to fail.
+    - Do NOT wrap the SEARCH/REPLACE block in markdown code fences
+      (`\`\`\`cpp`, `\`\`\`", etc.).  OpenEvolve parses the raw block.
+
+  evaluator_system_message: "You are an expert C++ code reviewer. Evaluate the mutated chess engine for correctness, compilation safety, adherence to the fixed chess-rule mask, and proper use of the platform-agnostic SIMD abstraction blocks."
+
+  num_top_programs: 3
+  num_diverse_programs: 2
+  include_artifacts: true
+
+# Database configuration
+database:
+  population_size: 100
+  archive_size: 20
+  num_islands: 3
+  elite_selection_ratio: 0.2
+  exploitation_ratio: 0.7
+  # MAP-Elites axes: speed and strength are exposed as independent feature dimensions
+  feature_dimensions:
+    - "nodes_per_second"
+    - "win_rate"
+  feature_bins: 10
+
+# Evaluator configuration
+evaluator:
+  timeout: 600          # 10 minutes; the evaluator itself runs for ~4.5 minutes
+  max_retries: 0        # compilation/evaluation is deterministic; no retries needed
+  cascade_evaluation: false
+  parallel_evaluations: 1
+
+# Evolution settings
+diff_based_evolution: true
+max_code_length: 30000
+
+# Early stopping
+early_stopping_patience: null
+convergence_threshold: 0.001
+early_stopping_metric: "fitness"
+
+# Evolution trace
+evolution_trace:
+  enabled: false
