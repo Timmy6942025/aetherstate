@@ -20,6 +20,10 @@
  * Quantization: int8 weights, int32 activations, fixed-point shift=7.
  * SIMD: uses the platform-agnostic SIMD_DOT16() macro from chess_runtime.hpp,
  * compiling to ARM NEON on this host and AVX2/AVX-512 on x86_64 cloud nodes.
+ *
+ * Architecture constants (INPUT_FEATURES, ACCUMULATOR_SIZE, HIDDEN_SIZE,
+ * OUTPUT_SLOTS, MOVE_STRIDE, QUANT_SHIFT) are injected by the evaluator as
+ * preprocessor macros before this file is compiled. Do NOT define them here.
  */
 
 #include "chess_runtime.hpp"
@@ -29,22 +33,27 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <random>
+#include <vector>
 
 // # EVOLVE-BLOCK-START
 
 // ---------------------------------------------------------------------------
 // Network hyper-parameters and quantization constants
 // ---------------------------------------------------------------------------
-static constexpr int INPUT_FEATURES   = 768;   // 12 bitboards * 64 squares
-static constexpr int ACCUMULATOR_SIZE = 256;
-static constexpr int HIDDEN_SIZE      = 32;
-static constexpr int OUTPUT_SLOTS     = 4096;  // from-square (64) * to-square (64)
-static constexpr int MOVE_STRIDE      = 64;
-
-// Fixed-point arithmetic: weights are int8, activations are int32, then
-// shifted right by QUANT_SHIFT to keep values in range.
-static constexpr int QUANT_SHIFT = 7;
+// The following are injected as #define macros by the AetherState evaluator:
+//   INPUT_FEATURES   = 768  (12 bitboards * 64 squares)
+//   ACCUMULATOR_SIZE = 256
+//   HIDDEN_SIZE      = 32
+//   OUTPUT_SLOTS     = 4096 (from-square 64 * to-square 64)
+//   MOVE_STRIDE      = 64
+//   QUANT_SHIFT      = 7
+//
+// Do not define them in this file; the evaluator prepends them before compile.
+// You may change how they are used (e.g., SIMD loops, layer shapes), but the
+// evaluator will reject combinations that break the weight-file format or
+// exceed safe size limits.
 
 // ---------------------------------------------------------------------------
 // Neural network weight storage (int8, row-major)
@@ -285,8 +294,17 @@ bool load_weights(const char *path) {
     char magic[8] = {};
     in.read(magic, 8);
     if (std::memcmp(magic, WEIGHT_FILE_MAGIC, 8) != 0) return false;
-    in.read(reinterpret_cast<char*>(&g_net), sizeof(g_net));
-    return in.good();
+    // Accept variable-length weight payloads so the LLM can experiment with
+    // new topologies without the evaluator hard-coding the exact struct size.
+    // We copy as many bytes as fit into g_net and zero-pad the remainder.
+    std::vector<char> buffer((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (buffer.empty()) return false;
+    size_t to_copy = std::min(buffer.size(), sizeof(g_net));
+    std::memcpy(&g_net, buffer.data(), to_copy);
+    if (to_copy < sizeof(g_net)) {
+        std::memset(reinterpret_cast<char*>(&g_net) + to_copy, 0, sizeof(g_net) - to_copy);
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +323,6 @@ bool load_weights(const char *path) {
 // simply feed them into its own network.
 // ---------------------------------------------------------------------------
 struct alignas(4) TrainingRecord {
-    static constexpr int MAX_FEATURES = 32;
     int32_t side_to_move;
     int32_t n_features;
     int32_t features[MAX_FEATURES];
@@ -327,9 +344,9 @@ static void generate_training_data(int games, FILE *out) {
             auto feats = position_features(p);
             TrainingRecord rec;
             rec.side_to_move = (int32_t)p.side;
-            rec.n_features = (int32_t)std::min<size_t>(feats.size(), TrainingRecord::MAX_FEATURES);
+            rec.n_features = (int32_t)std::min<size_t>(feats.size(), (size_t)MAX_FEATURES);
             for (size_t i = 0; i < (size_t)rec.n_features; ++i) rec.features[i] = feats[i];
-            for (size_t i = (size_t)rec.n_features; i < TrainingRecord::MAX_FEATURES; ++i) rec.features[i] = -1;
+            for (size_t i = (size_t)rec.n_features; i < (size_t)MAX_FEATURES; ++i) rec.features[i] = -1;
 
             Move m = policy_move(p);
             if (m.from < 0) break;
@@ -375,8 +392,14 @@ int main(int argc, char **argv) {
             std::cerr << "Failed to load weights from " << argv[2] << std::endl;
             return 1;
         }
-        std::cout << "WEIGHTS loaded=" << argv[2] << std::endl;
+        std::cerr << "WEIGHTS loaded=" << argv[2] << std::endl;
         // Remaining arguments specify the mode to run with the loaded weights.
+        // Special case: generate training data using the loaded weights.
+        if (argc > 3 && std::string(argv[3]) == "generate_data") {
+            int games = (argc > 4) ? std::stoi(argv[4]) : 100;
+            generate_training_data(games, stdout);
+            return 0;
+        }
         if (argc > 3) {
             std::vector<char*> args;
             args.reserve(argc - 2);

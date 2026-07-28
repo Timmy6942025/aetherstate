@@ -557,14 +557,26 @@ inline int aetherstate_main(int argc, char **argv) {
     } else if (mode == "random_time") {
         double sec = (argc > 2) ? std::stod(argv[2]) : 180.0;
         auto start = std::chrono::high_resolution_clock::now();
-        int wins = 0, draws = 0, losses = 0, games = 0;
+        int wins = 0, draws = 0, losses = 0, games = 0, total_plies = 0;
         while (std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count() < sec) {
-            int r = play_random_game(true);
+            Position p = start_position();
+            int ply = 0;
+            int r = game_result(p, ply);
+            while (r == 2) {
+                Move m = policy_move(p);
+                if (m.from < 0) break;
+                make_move(p, m);
+                ++ply;
+                r = game_result(p, ply);
+            }
             if (r == 1) ++wins; else if (r == 0) ++draws; else ++losses;
+            total_plies += ply;
             ++games;
         }
         double wr = games ? (wins + 0.5 * draws) / games : 0.0;
-        std::cout << "RANDOM win_rate=" << wr << " games=" << games << std::endl;
+        double dr = games ? (double)draws / games : 0.0;
+        double avg_len = games ? (double)total_plies / games : 0.0;
+        std::cout << "RANDOM win_rate=" << wr << " draw_rate=" << dr << " avg_game_length=" << avg_len << " games=" << games << std::endl;
         return 0;
     } else if (mode == "selfplay_time") {
         double sec = (argc > 2) ? std::stod(argv[2]) : 180.0;

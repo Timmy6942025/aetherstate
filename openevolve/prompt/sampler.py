@@ -63,6 +63,7 @@ class PromptSampler:
         program_artifacts: Optional[Dict[str, Union[str, bytes]]] = None,
         feature_dimensions: Optional[List[str]] = None,
         current_changes_description: Optional[str] = None,
+        research_note: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, str]:
         """
@@ -80,6 +81,7 @@ class PromptSampler:
             diff_based_evolution: Whether to use diff-based evolution (True) or full rewrites (False)
             template_key: Optional override for template key
             program_artifacts: Optional artifacts from program evaluation
+            research_note: Optional research note from the parent program
             **kwargs: Additional keys to replace in the user prompt
 
         Returns:
@@ -143,6 +145,17 @@ class PromptSampler:
         if self.config.include_artifacts and program_artifacts:
             artifacts_section = self._render_artifacts(program_artifacts)
 
+        # Format research note from the parent program
+        research_note_section = ""
+        if research_note and research_note.strip():
+            research_note_section = (
+                "\n\n## Parent Research Note\n\n"
+                + research_note.strip()
+                + "\n\nUse the parent's hypothesis and findings as context, but do not "
+                "feel constrained by it. If the hypothesis was falsified, explain why "
+                "and propose a different direction."
+            )
+
         # Apply stochastic template variations if enabled
         if self.config.use_template_stochasticity:
             user_template = self._apply_template_variations(user_template)
@@ -153,18 +166,25 @@ class PromptSampler:
         feature_coords = format_feature_coordinates(program_metrics, feature_dimensions)
 
         # Format the final user message
-        user_message = user_template.format(
-            metrics=metrics_str,
-            fitness_score=f"{fitness_score:.4f}",
-            feature_coords=feature_coords,
-            feature_dimensions=", ".join(feature_dimensions) if feature_dimensions else "None",
-            improvement_areas=improvement_areas,
-            evolution_history=evolution_history,
-            current_program=current_program,
-            language=language,
-            artifacts=artifacts_section,
-            **kwargs,
-        )
+        format_kwargs = {
+            "metrics": metrics_str,
+            "fitness_score": f"{fitness_score:.4f}",
+            "feature_coords": feature_coords,
+            "feature_dimensions": ", ".join(feature_dimensions) if feature_dimensions else "None",
+            "improvement_areas": improvement_areas,
+            "evolution_history": evolution_history,
+            "current_program": current_program,
+            "language": language,
+            "artifacts": artifacts_section,
+            "research_note": research_note_section,
+        }
+        format_kwargs.update(kwargs)
+        # Older/custom templates may not include the {research_note} placeholder;
+        # omitting it avoids a KeyError while still allowing the default templates
+        # to display the research note.
+        if "{research_note}" not in user_template:
+            format_kwargs.pop("research_note", None)
+        user_message = user_template.format(**format_kwargs)
 
         if self.config.programs_as_changes_description:
             user_message = self.template_manager.get_template(

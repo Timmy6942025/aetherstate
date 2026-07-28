@@ -258,6 +258,19 @@ class OpenEvolve:
             )
         )
 
+        # Reset AetherState research notebooks at the start of each fresh run so
+        # stale agendas/findings from previous experiments do not leak into this
+        # run.  The files live next to the task file for easy inspection.
+        if should_add_initial and "tasks/aetherstate" in self.initial_program_path:
+            for stale_name in ("AGENDA.md", "FINDINGS.md"):
+                stale_path = Path(self.initial_program_path).resolve().parent / stale_name
+                if stale_path.exists():
+                    try:
+                        stale_path.unlink()
+                        logger.info(f"Removed stale {stale_path.name} from previous run")
+                    except OSError:
+                        pass
+
         if should_add_initial:
             logger.info("Adding initial program to database")
             initial_program_id = str(uuid.uuid4())
@@ -267,6 +280,13 @@ class OpenEvolve:
                 self.initial_program_code, initial_program_id
             )
 
+            # Check for artifacts (including the research notebook) to carry into
+            # the new Program's metadata.
+            initial_artifacts = self.evaluator.get_pending_artifacts(initial_program_id)
+            initial_metadata: Dict[str, Any] = {}
+            if initial_artifacts and initial_artifacts.get("research_notebook"):
+                initial_metadata["research_note"] = initial_artifacts["research_notebook"]
+
             initial_program = Program(
                 id=initial_program_id,
                 code=self.initial_program_code,
@@ -274,12 +294,13 @@ class OpenEvolve:
                 language=self.config.language,
                 metrics=initial_metrics,
                 iteration_found=start_iteration,
+                metadata=initial_metadata,
             )
 
             self.database.add(initial_program)
 
-            # Check for and store artifacts from initial program
-            initial_artifacts = self.evaluator.get_pending_artifacts(initial_program_id)
+            # Store artifacts after the program has been added so the database
+            # can associate them with the program.
             if initial_artifacts:
                 self.database.store_artifacts(initial_program_id, initial_artifacts)
                 logger.info(f"Stored artifacts for initial program")
@@ -356,6 +377,17 @@ class OpenEvolve:
             if self.parallel_controller:
                 self.parallel_controller.stop()
                 self.parallel_controller = None
+
+            # Make sure any in-flight meta-analysis task is awaited before
+            # shutting down so the event loop does not warn about a dangling
+            # coroutine and any pending agenda/finding writes are flushed.
+            pending = getattr(self, "_pending_meta_analysis", None)
+            if pending is not None and not pending.done():
+                try:
+                    await asyncio.wait_for(pending, timeout=30.0)
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.debug(f"Meta-analysis task cancelled during shutdown: {e}")
+                    pending.cancel()
 
             # Close evolution tracer
             if self.evolution_tracer:
@@ -485,6 +517,111 @@ class OpenEvolve:
         self.database.load(checkpoint_path)
         logger.info(f"Checkpoint loaded successfully (iteration {self.database.last_iteration})")
 
+    async def _run_meta_analysis(self, iteration: int) -> None:
+        """Periodically summarize recent research notes into agenda and findings.
+
+        This is part of the AetherState R&D plan (Phase 4/5). It collects the
+        most recent research notes, asks the LLM to update the cumulative
+        findings and propose a short-term agenda, and writes them to disk so
+        they can be injected into subsequent prompts.
+        """
+        # Derive the task directory from the initial program path so this works
+        # regardless of where the openevolve package is installed.
+        initial_path = Path(self.initial_program_path).resolve()
+        aetherstate_dir = initial_path.parent
+        if not aetherstate_dir.is_dir():
+            return
+
+        agenda_path = aetherstate_dir / "AGENDA.md"
+        findings_path = aetherstate_dir / "FINDINGS.md"
+
+        # Only run meta-analysis for the AetherState task.
+        if "tasks/aetherstate" not in self.initial_program_path and not agenda_path.exists():
+            return
+
+        # Collect recent successful programs with research notes.
+        recent_programs = sorted(
+            self.database.programs.values(),
+            key=lambda p: p.iteration_found,
+            reverse=True,
+        )[:20]
+
+        notes = []
+        for prog in recent_programs:
+            note = prog.metadata.get("research_note", "")
+            if note and note.strip():
+                notes.append(
+                    f"Program {prog.id[:8]} (iteration {prog.iteration_found}, "
+                    f"fitness {prog.metrics.get('fitness', 0):.4f}):\n{note.strip()}"
+                )
+
+        if not notes:
+            return
+
+        prev_agenda = agenda_path.read_text(encoding="utf-8") if agenda_path.exists() else ""
+        prev_findings = findings_path.read_text(encoding="utf-8") if findings_path.exists() else ""
+
+        prompt = (
+            "You are the principal investigator for an automated chess-AI research loop.\n\n"
+            "Review the previous agenda and findings, then the recent research notes, "
+            "and produce updated scientific direction.\n\n"
+            "=== Previous Research Agenda ===\n" + prev_agenda + "\n\n"
+            "=== Cumulative Findings ===\n" + prev_findings + "\n\n"
+            "=== Recent Research Notes ===\n" + "\n\n".join(notes) + "\n\n"
+            "Return a JSON object with exactly two keys: 'agenda' and 'findings'.\n"
+            "- 'agenda' should be a concise markdown list (max 5 items) of concrete "
+            "hypotheses to explore in the next block of iterations.\n"
+            "- 'findings' should be a concise markdown summary of what worked, what "
+            "failed, and open questions. Consolidate older findings to stay under "
+            "800 words total.\n"
+        )
+
+        try:
+            response = await self.llm_ensemble.generate_with_context(
+                system_message=(
+                    "You are a scientific research director. Produce only valid JSON "
+                    "with keys 'agenda' and 'findings'. Keep the total response under "
+                    "1000 words."
+                ),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+        except Exception as e:
+            logger.warning(f"Meta-analysis LLM call failed at iteration {iteration}: {e}")
+            return
+
+        if not response:
+            logger.warning(f"Meta-analysis LLM returned empty response at iteration {iteration}")
+            return
+
+        try:
+            import json
+
+            text = response.strip()
+            # Strip markdown code fences if the LLM wrapped the JSON.
+            if text.startswith("```"):
+                text = text.split("```", 2)[-1].strip()
+            if text.startswith("json"):
+                text = text[4:].strip()
+            parsed = json.loads(text)
+            agenda = parsed.get("agenda", "")
+            findings = parsed.get("findings", "")
+        except Exception as e:
+            logger.warning(f"Could not parse meta-analysis JSON at iteration {iteration}: {e}")
+            return
+
+        # Atomic write to avoid readers seeing a half-written file.
+        tmp_agenda = aetherstate_dir / "AGENDA.md.tmp"
+        tmp_findings = aetherstate_dir / "FINDINGS.md.tmp"
+        try:
+            tmp_agenda.write_text(str(agenda), encoding="utf-8")
+            tmp_findings.write_text(str(findings), encoding="utf-8")
+            tmp_agenda.replace(agenda_path)
+            tmp_findings.replace(findings_path)
+            logger.info(f"Updated research agenda and findings at iteration {iteration}")
+        except Exception as e:
+            logger.warning(f"Failed to write meta-analysis files at iteration {iteration}: {e}")
+
     async def _run_evolution_with_checkpoints(
         self, start_iteration: int, max_iterations: int, target_score: Optional[float]
     ) -> None:
@@ -492,9 +629,25 @@ class OpenEvolve:
         logger.info(f"Using island-based evolution with {self.config.database.num_islands} islands")
         self.database.log_island_status()
 
+        # Keep a reference to any in-flight meta-analysis so it is not garbage
+        # collected mid-flight.  Running it as a background task keeps the main
+        # event loop free to reap completed worker results.
+        self._pending_meta_analysis: Optional[asyncio.Task] = None
+
+        async def _checkpoint_and_meta_analysis(iteration: int) -> None:
+            self._save_checkpoint(iteration)
+            if self._pending_meta_analysis is not None:
+                # Wait for a previous meta-analysis to finish before starting a
+                # new one, but do not block checkpointing on it.
+                try:
+                    await self._pending_meta_analysis
+                except Exception:
+                    pass
+            self._pending_meta_analysis = asyncio.create_task(self._run_meta_analysis(iteration))
+
         # Run the evolution process with checkpoint callback
         await self.parallel_controller.run_evolution(
-            start_iteration, max_iterations, target_score, checkpoint_callback=self._save_checkpoint
+            start_iteration, max_iterations, target_score, checkpoint_callback=_checkpoint_and_meta_analysis
         )
 
         # Check if shutdown or early stopping was triggered

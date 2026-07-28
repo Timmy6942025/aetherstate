@@ -5,6 +5,8 @@
 
 {artifacts}
 
+{research_note}
+
 # Program Evolution History
 {evolution_history}
 

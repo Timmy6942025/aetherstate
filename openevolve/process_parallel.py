@@ -148,6 +148,9 @@ def _run_iteration_worker(
         # Get parent artifacts if available
         parent_artifacts = db_snapshot["artifacts"].get(parent_id)
 
+        # Carry forward the parent's research note so the LLM can build on it.
+        parent_research_note = parent.metadata.get("research_note", "")
+
         # Get island-specific programs for context
         parent_island = parent.metadata.get("island", db_snapshot["current_island"])
         island_programs = [
@@ -191,7 +194,27 @@ def _run_iteration_worker(
             program_artifacts=parent_artifacts,
             feature_dimensions=db_snapshot.get("feature_dimensions", []),
             current_changes_description=parent_changes_desc,
+            research_note=parent_research_note,
         )
+
+        # Inject AetherState research agenda and cumulative findings into the
+        # system prompt so the LLM can follow the high-level research direction.
+        try:
+            from pathlib import Path
+
+            eval_file = Path(_worker_evaluation_file)
+            agenda_path = eval_file.parent / "AGENDA.md"
+            findings_path = eval_file.parent / "FINDINGS.md"
+            injections = []
+            if agenda_path.exists():
+                injections.append(f"## Current Research Agenda\n{agenda_path.read_text(encoding='utf-8')}")
+            if findings_path.exists():
+                injections.append(f"## Cumulative Findings\n{findings_path.read_text(encoding='utf-8')}")
+            if injections:
+                prompt["system"] = prompt["system"] + "\n\n" + "\n\n".join(injections)
+        except Exception:
+            # Injection is best-effort; do not fail the iteration if files are missing.
+            pass
 
         iteration_start = time.time()
 
@@ -294,6 +317,12 @@ def _run_iteration_worker(
         # Get artifacts
         artifacts = _worker_evaluator.get_pending_artifacts(child_id)
 
+        # Extract the child's research note from evaluator artifacts so it can
+        # be passed to future prompts as institutional memory.
+        child_research_note = ""
+        if artifacts and isinstance(artifacts, dict):
+            child_research_note = artifacts.get("research_notebook", "")
+
         # Create child program
         child_program = Program(
             id=child_id,
@@ -308,6 +337,7 @@ def _run_iteration_worker(
                 "changes": changes_summary,
                 "parent_metrics": parent.metrics,
                 "island": parent_island,
+                "research_note": child_research_note,
             },
         )
 
@@ -731,7 +761,9 @@ class ProcessParallelController:
                         )
                         self.database.log_island_status()
                         if checkpoint_callback:
-                            checkpoint_callback(completed_iteration)
+                            callback_result = checkpoint_callback(completed_iteration)
+                            if asyncio.iscoroutine(callback_result):
+                                await callback_result
 
                     # Check target score
                     if target_score is not None and child_program.metrics:
